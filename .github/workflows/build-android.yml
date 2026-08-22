@@ -1,0 +1,135 @@
+name: Build Android Release
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          
+      - name: Install dependencies
+        run: |
+          npm ci
+          cd server && npm ci && cd ..
+          
+      - name: Build frontend
+        run: npm run build
+        
+      - name: Bundle server with esbuild
+        run: |
+          npm install -g esbuild
+          mkdir -p dist/AutoEditor-android
+          esbuild server/index.js --bundle --platform=node --format=cjs --minify --outfile=dist/AutoEditor-android/bundle.cjs
+          
+      - name: Assemble package
+        run: |
+          cp server/assets/caption.ttf dist/AutoEditor-android/
+          cp -r out dist/AutoEditor-android/
+          
+      - name: Create start.sh
+        run: |
+          cat > dist/AutoEditor-android/start.sh << 'EOF'
+          #!/usr/bin/env bash
+          cd "$(dirname "$0")"
+          chmod -R u+rwX . 2>/dev/null || true
+          
+          if ! command -v node >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "First run: installing Node.js and ffmpeg (one-time, needs internet)..."
+            yes | pkg update >/dev/null 2>&1 || pkg update -y
+            pkg install -y nodejs ffmpeg
+          fi
+          
+          if ! command -v node >/dev/null 2>&1; then echo "Node.js install failed. Try: pkg install nodejs"; exit 1; fi
+          FF="$(command -v ffmpeg)"
+          if [ -z "$FF" ]; then echo "ffmpeg install failed. Try: pkg install ffmpeg"; exit 1; fi
+          export FFMPEG_PATH="$FF"
+          export CAPTION_FONT_PATH="$(pwd)/caption.ttf"
+          export FRONTEND_DIR="$(pwd)/out"
+          export OPEN_BROWSER=0
+          export PORT="${PORT:-4000}"
+          
+          CORES="$(nproc 2>/dev/null || echo 4)"
+          export RENDER_THREADS="${RENDER_THREADS:-$(( CORES > 2 ? (CORES + 1) / 2 : 1 ))}"
+          export RENDER_NICE="${RENDER_NICE:-15}"
+          export RENDER_ZOOM_SS="${RENDER_ZOOM_SS:-2}"
+          echo "Render load: RENDER_THREADS=$RENDER_THREADS RENDER_NICE=$RENDER_NICE RENDER_ZOOM_SS=$RENDER_ZOOM_SS (hardware encoder auto-detected)"
+          
+          if [ ! -d "$HOME/storage" ]; then
+            echo "Setting up storage access — tap Allow on the permission dialog..."
+            termux-setup-storage 2>/dev/null || true
+            sleep 3
+          fi
+          
+          if [ -d "$HOME/storage/downloads" ]; then
+            export OUTPUT_DIR="$HOME/storage/downloads/AutoEditor"
+          elif [ -d "$HOME/storage/shared" ]; then
+            export OUTPUT_DIR="$HOME/storage/shared/AutoEditor"
+          else
+            export OUTPUT_DIR="$HOME/AutoEditor-output"
+          fi
+          mkdir -p "$OUTPUT_DIR" 2>/dev/null || true
+          REAL_OUT="$(cd "$OUTPUT_DIR" 2>/dev/null && pwd -P)"
+          [ -n "$REAL_OUT" ] && export OUTPUT_DIR="$REAL_OUT"
+          
+          termux-wake-lock 2>/dev/null || true
+          trap 'termux-wake-unlock 2>/dev/null || true' EXIT
+          
+          echo "AutoEditor is running."
+          echo "Open  http://localhost:${PORT}  in Chrome/Firefox on this phone."
+          echo "Finished videos are saved to:  $OUTPUT_DIR"
+          echo "You can close the browser after hitting Render — it keeps rendering and saves there."
+          echo "To check progress after closing the browser: switch back to Termux (it prints Rendering... %)."
+          echo "Keep this Termux session open. Press Ctrl+C to stop."
+          node bundle.cjs
+          EOF
+          chmod +x dist/AutoEditor-android/start.sh
+          
+      - name: Create README
+        run: |
+          cat > dist/AutoEditor-android/READ\ ME\ FIRST.txt << 'EOF'
+          AutoEditor for Android (via Termux)
+          Runs entirely on your phone. Nothing is uploaded.
+          
+          SETUP
+          1. Install Termux from the Google Play Store.
+          2. Open Termux and give it file access (once):
+               termux-setup-storage
+          3. Go to this folder (e.g. if it's in Downloads):
+               cd ~/storage/downloads/AutoEditor-android
+          4. Run:
+               bash start.sh
+          
+          That's it. On the first run start.sh installs Node.js + ffmpeg for you
+          (one-time, needs internet), then starts the app.
+          
+          USE
+             Open  http://localhost:4000  in Chrome or Firefox on the same phone.
+             To stop: return to Termux and press Ctrl+C.
+             Next time, just run "bash start.sh" again.
+          
+          NOTES
+          - Rendering runs on the phone's CPU; short/medium videos work best.
+          - After the one-time setup, no internet is needed.
+          EOF
+          
+      - name: Zip the package
+        run: |
+          cd dist
+          zip -r AutoEditor-android.zip AutoEditor-android/
+          
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoEditor-android
+          path: dist/AutoEditor-android.zip
